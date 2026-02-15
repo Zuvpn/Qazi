@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# اگر از pipe اجرا شد، ورودی را از ترمینال واقعی بگیر
+if [[ ! -t 0 && -r /dev/tty ]]; then
+  exec </dev/tty
+fi
+QAZI_DIR="/etc/qazi"
+TUN_DIR="$QAZI_DIR/tunnels.d"
+
+# ---------- UI ----------
+print_header() {
+  clear
+  cat <<'ART'
+      ____   ___   _______
+     / __ \ / _ \ /__  __/
+    / /_/ //  __/   / /
+    \___\_\\___/   /_/
+
+          QAZI
+ART
+  echo
+  echo "Qazi - مدیریت تانل‌های GOST (h2 / h2+tls)"
+  echo "======================================================="
+  echo
+}
+
+pause() { echo; read -rp "برای ادامه Enter بزنید..."; }
+
+die() { echo "❌ $*"; exit 1; }
+
+need_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "این برنامه باید با root اجرا شود. مثال: sudo Qazi"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_dirs() {
+  mkdir -p "$TUN_DIR"
+}
+
+svc_name() { echo "qazi-$1.service"; }
+
+systemd_ok() {
+  have systemctl || die "systemctl پیدا نشد (سیستم شما systemd ندارد یا ناقص است)."
+}
+
+open_firewall_port() {
+  local port="$1"
+  if have ufw; then
+    ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+  fi
+}
+
+gost_ok() {
+  have gost || return 1
+  return 0
+}
+
+install_or_update_gost() {
+  print_header
+  cat <<'TXT'
+راهنمای نصب/آپدیت GOST:
+- دقیقاً طبق دستور رسمی پروژه انجام می‌شود:
+
+  bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install
+
+نکات:
+- اینترنت لازم است.
+- اگر قبلاً نصب باشد، معمولاً آپدیت می‌شود.
+TXT
+  echo
+  read -rp "ادامه بدهم؟ (y/n): " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || return 0
+
+  have curl || die "curl نصب نیست. (از install.sh استفاده کن یا دستی نصب کن: apt install curl -y)"
+
+  bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install
+
+  echo
+  echo "✅ GOST نصب/آپدیت شد."
+  echo -n "نسخه: "
+  gost -V || true
+  pause
+}
+
+# ---------- Tunnel store ----------
+conf_path() { echo "$TUN_DIR/$1.conf"; }
+
+conf_exists() { [[ -f "$(conf_path "$1")" ]]; }
+
+save_conf() {
+  local name="$1"; shift
+  local p; p="$(conf_path "$name")"
+  {
+    echo "# Qazi tunnel config"
+    for kv in "$@"; do echo "$kv"; done
+  } >"$p"
+}
+
+list_tunnels_quiet() {
+  if compgen -G "$TUN_DIR/*.conf" >/dev/null; then
+    for f in "$TUN_DIR"/*.conf; do basename "$f" .conf; done
+  fi
+}
+
+# ---------- systemd service ----------
+write_service() {
+  local name="$1"
+  local exec_cmd="$2"
+
+  local unit="/etc/systemd/system/$(svc_name "$name")"
+  cat >"$unit" <<EOF
+[Unit]
+Description=Qazi GOST Tunnel: ${name}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${exec_cmd}
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "$(svc_name "$name")" >/dev/null 2>&1 || true
+}
+
+start_svc() {
+  local name="$1"
+  systemctl restart "$(svc_name "$name")"
+}
+
+stop_svc() {
+  local name="$1"
+  systemctl stop "$(svc_name "$name")" >/dev/null 2>&1 || true
+}
+
+status_svc() {
+  local name="$1"
+  systemctl status "$(svc_name "$name")" --no-pager || true
+}
+
+logs_svc() {
+  local name="$1"
+  print_header
+  echo "لاگ زنده تانل: $name"
+  echo "برای خروج: q"
+  echo
+  journalctl -u "$(svc_name "$name")" -e -f
+}
+
+delete_tunnel() {
+  print_header
+  read -rp "نام تانل برای حذف: " name
+  conf_exists "$name" || { echo "❌ تانل پیدا نشد."; pause; return; }
+
+  read -rp "⚠️ مطمئن هستید؟ (y/n): " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || return 0
+
+  stop_svc "$name"
+  systemctl disable "$(svc_name "$name")" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/$(svc_name "$name")"
+  rm -f "$(conf_path "$name")"
+  systemctl daemon-reload
+
+  echo "✅ حذف شد."
+  pause
+}
+
+# ---------- Wizard ----------
+create_tunnel() {
+  print_header
+  gost_ok || { echo "❌ GOST نصب نیست. اول گزینه 1 را بزن."; pause; return; }
+  systemd_ok
+
+  cat <<'TXT'
+وایزارد ساخت تانل:
+
+نقش‌ها:
+  1) Listener  (این سرور گوش می‌دهد) ← معمولاً سرور خارج
+  2) Connector (این سرور وصل می‌شود) ← معمولاً سرور ایران
+
+پروتکل‌ها:
+  1) بدون TLS : http2://
+  2) با TLS   : http+h2://    (h2 + TLS با cert خودکار GOST)
+
+نکته:
+- اگر x-ui روی 80/8080 فعال است، برای GOST یک پورت آزاد مثل 9090 انتخاب کنید.
+TXT
+  echo
+
+  read -rp "نام تانل (مثال: ir_to_out_80): " name
+  name="${name// /_}"
+  [[ -n "$name" ]] || { echo "❌ نام خالی است."; pause; return; }
+  ! conf_exists "$name" || { echo "❌ این نام از قبل وجود دارد."; pause; return; }
+
+  echo
+  echo "نقش:"
+  echo "  1) Listener"
+  echo "  2) Connector"
+  read -rp "انتخاب (1/2): " role
+
+  echo
+  echo "پروتکل:"
+  echo "  1) بدون TLS (http2)"
+  echo "  2) با TLS   (http+h2)"
+  read -rp "انتخاب (1/2): " proto_sel
+  local proto="http2"
+  [[ "$proto_sel" == "2" ]] && proto="http+h2"
+
+  echo
+  read -rp "احراز هویت (user/pass) فعال شود؟ (y/n): " use_auth
+  local user="" pass=""
+  if [[ "$use_auth" =~ ^[Yy]$ ]]; then
+    read -rp "نام کاربری: " user
+    read -rsp "رمز عبور: " pass
+    echo
+  fi
+
+  if [[ "$role" == "1" ]]; then
+    echo
+    echo "تنظیمات Listener:"
+    read -rp "پورت تونل برای گوش دادن (مثال 9090): " tunnel_port
+    read -rp "پورت inbound مقصد (مثال 80): " inbound_port
+    read -rp "IP مقصد (پیشفرض 127.0.0.1): " inbound_host_in
+    local inbound_host="${inbound_host_in:-127.0.0.1}"
+
+    [[ "$tunnel_port" =~ ^[0-9]+$ ]] || { echo "❌ پورت تونل نامعتبر."; pause; return; }
+    [[ "$inbound_port" =~ ^[0-9]+$ ]] || { echo "❌ پورت inbound نامعتبر."; pause; return; }
+
+    open_firewall_port "$tunnel_port"
+
+    local listen_url
+    if [[ "$use_auth" =~ ^[Yy]$ ]]; then
+      listen_url="${proto}://${user}:${pass}@:${tunnel_port}"
+    else
+      listen_url="${proto}://:${tunnel_port}"
+    fi
+
+    local exec_cmd="/usr/local/bin/gost -L ${listen_url} -F tcp://${inbound_host}:${inbound_port}"
+
+    save_conf "$name" \
+      "NAME=${name}" \
+      "ROLE=listener" \
+      "PROTO=${proto}" \
+      "TUNNEL_PORT=${tunnel_port}" \
+      "INBOUND_HOST=${inbound_host}" \
+      "INBOUND_PORT=${inbound_port}" \
+      "AUTH=${use_auth}" \
+      "USER=${user}" \
+      "PASS=${pass}"
+
+    write_service "$name" "$exec_cmd"
+    start_svc "$name"
+
+    echo
+    echo "✅ Listener ساخته و اجرا شد."
+    echo "مسیر: ${proto}://:${tunnel_port}  →  tcp://${inbound_host}:${inbound_port}"
+    pause
+    return
+  fi
+
+  if [[ "$role" == "2" ]]; then
+    echo
+    echo "تنظیمات Connector:"
+    read -rp "پورت لوکال روی این سرور (مثال 80): " local_port
+    read -rp "IP سرور مقابل (مثال 212.87.198.106): " remote_ip
+    read -rp "پورت تونل روی سرور مقابل (مثال 9090): " remote_port
+
+    [[ "$local_port" =~ ^[0-9]+$ ]] || { echo "❌ پورت لوکال نامعتبر."; pause; return; }
+    [[ "$remote_port" =~ ^[0-9]+$ ]] || { echo "❌ پورت ریموت نامعتبر."; pause; return; }
+    [[ -n "$remote_ip" ]] || { echo "❌ IP خالی است."; pause; return; }
+
+    local remote_url
+    if [[ "$use_auth" =~ ^[Yy]$ ]]; then
+      remote_url="${proto}://${user}:${pass}@${remote_ip}:${remote_port}"
+    else
+      remote_url="${proto}://${remote_ip}:${remote_port}"
+    fi
+
+    if [[ "$proto" == "http+h2" ]]; then
+      echo
+      echo "TLS فعال است."
+      echo "اگر Verify را روشن کنی، گواهی بررسی می‌شود."
+      echo "بدون دامنه هم می‌توان با serverName=gost.run استفاده کرد."
+      read -rp "TLS Verify (secure=true) فعال شود؟ (y/n): " tv
+      if [[ "$tv" =~ ^[Yy]$ ]]; then
+        remote_url="${remote_url}?secure=true&serverName=gost.run"
+      fi
+    fi
+
+    local exec_cmd="/usr/local/bin/gost -L tcp://:${local_port} -F ${remote_url}"
+
+    save_conf "$name" \
+      "NAME=${name}" \
+      "ROLE=connector" \
+      "PROTO=${proto}" \
+      "LOCAL_PORT=${local_port}" \
+      "REMOTE_IP=${remote_ip}" \
+      "REMOTE_PORT=${remote_port}" \
+      "AUTH=${use_auth}" \
+      "USER=${user}" \
+      "PASS=${pass}"
+
+    write_service "$name" "$exec_cmd"
+    start_svc "$name"
+
+    echo
+    echo "✅ Connector ساخته و اجرا شد."
+    echo "مسیر: tcp://:${local_port}  →  ${remote_url}"
+    pause
+    return
+  fi
+
+  echo "❌ نقش نامعتبر."
+  pause
+}
+
+# ---------- Management menus ----------
+list_tunnels() {
+  print_header
+  echo "تانل‌های موجود:"
+  echo "-------------------------------------------------------"
+  local any=0
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    any=1
+    echo "• $t"
+  done < <(list_tunnels_quiet || true)
+  [[ "$any" -eq 1 ]] || echo "(هیچ تانلی ساخته نشده)"
+  echo "-------------------------------------------------------"
+  pause
+}
+
+restart_tunnel() {
+  print_header
+  read -rp "نام تانل: " name
+  conf_exists "$name" || { echo "❌ تانل پیدا نشد."; pause; return; }
+  start_svc "$name"
+  echo "✅ اجرا/ری‌استارت شد."
+  pause
+}
+
+stop_tunnel() {
+  print_header
+  read -rp "نام تانل: " name
+  conf_exists "$name" || { echo "❌ تانل پیدا نشد."; pause; return; }
+  stop_svc "$name"
+  echo "✅ متوقف شد."
+  pause
+}
+
+status_tunnel() {
+  print_header
+  read -rp "نام تانل: " name
+  conf_exists "$name" || { echo "❌ تانل پیدا نشد."; pause; return; }
+  status_svc "$name"
+  pause
+}
+
+logs_tunnel() {
+  read -rp "نام تانل: " name
+  conf_exists "$name" || { echo "❌ تانل پیدا نشد."; pause; return; }
+  logs_svc "$name"
+}
+
+# ---------- Main ----------
+menu() {
+  while true; do
+    print_header
+    echo "1) نصب/آپدیت GOST (رسمی)"
+    echo "2) ساخت تانل جدید (Wizard)"
+    echo "3) لیست تانل‌ها"
+    echo "4) اجرای تانل (Restart)"
+    echo "5) توقف تانل"
+    echo "6) وضعیت تانل"
+    echo "7) لاگ تانل (Live)"
+    echo "8) حذف تانل"
+    echo "0) خروج"
+    echo
+    read -rp "انتخاب شما: " c
+    case "$c" in
+      1) install_or_update_gost ;;
+      2) create_tunnel ;;
+      3) list_tunnels ;;
+      4) restart_tunnel ;;
+      5) stop_tunnel ;;
+      6) status_tunnel ;;
+      7) logs_tunnel ;;
+      8) delete_tunnel ;;
+      0) exit 0 ;;
+      *) echo "گزینه نامعتبر"; pause ;;
+    esac
+  done
+}
+
+need_root
+ensure_dirs
+menu
